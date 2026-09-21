@@ -37,7 +37,7 @@ Codex 默认关闭且默认不自动修复，因为它**整体替换**内置指�
 ./autorepair/keysmith-autorepair.py repair --platform zcode --yes
 ./autorepair/keysmith-autorepair.py revert --platform codex --yes
 
-# 平台开关
+# 平台开关（enable 会顺手完成首次注入，见下面「什么时候会写盘」）
 ./autorepair/keysmith-autorepair.py enable  --platform codex --auto-repair
 ./autorepair/keysmith-autorepair.py disable --platform codex
 ./autorepair/keysmith-autorepair.py platforms --json
@@ -74,14 +74,24 @@ Codex 默认关闭且默认不自动修复，因为它**整体替换**内置指�
 - 需要让定时任务也尝试写入时，把 `config.json` 的 `agent.detect_only` 设为 `false`——只在你确认该
   上下文确实有权限时才这么做，否则每次都会得到一条注定失败的记录。
 
-## 自动修复的两道门槛
+## 什么时候会写盘：两类动作，两套门槛
 
-无人值守的自愈只会在**同时**满足以下条件时写盘：
+**人的明确动作（不走基线门槛）**
+
+| 动作 | 行为 |
+| --- | --- |
+| `enable --platform X`（含 Bar Control 里勾选「启用」） | 打开开关**并立刻完成首次注入**：该平台若还是 `needs_repair`，现在就写好，不会停在「开了但没生效」 |
+| `repair --platform X --yes` | 失效就重打补丁并验证 |
+| `disable` | **只关开关**，不写任何文件（已写入的注入保持原样；要撤走用 `revert`） |
+
+**无人值守自愈（`check --auto`，也含 Bar Control 的自动修复）**
+
+只在**同时**满足以下条件时写盘：
 
 1. 该平台 `enabled` 且 `auto_repair` 为真；
 2. 该平台**已经有过一次被确认的注入**（state 里有 baseline，快照里体现为 `baseline_ready`）。
 
-也就是说，一台从未确认注入过的机器不会被自动打补丁——第一次注入必须由人明确触发一次（CLI `repair --yes`，或 Bar Control / 发布管理中心里的「修复」按钮）。
+也就是说，一台从未确认注入过的机器不会被后台程序擅自改动——第一次注入得由人明确触发（勾一次「启用」就够，见上表）。这条门槛在代码里是 `platform_status(..., baseline_policy="require")`；人的动作走 `"any"`。
 
 任何情况下，`unsupported`（锚点不认识）都**不会**被自动修复，也不会被手动修复绕过：`repair` 在 `needs_repair` 之外的失效状态下不做写入。
 

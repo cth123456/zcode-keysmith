@@ -77,26 +77,27 @@ def collect_status(
     ids: list[str],
     *,
     repair: bool,
-    auto_only: bool = False,
+    unattended: bool = False,
 ) -> list[dict[str, object]]:
     """Probe (and optionally repair) each platform.
 
-    auto_only is the unattended path: it repairs only platforms the user marked
-    auto_repair AND that were already confirmed injected once (a recorded
-    baseline).  A machine that was never injected is never patched unattended.
+    unattended 是无人值守路径（`check --auto` 与 Bar Control 的自愈）：只修用户
+    明确开了 auto_repair、且此前**已经确认注入过**（有基线）的平台——一台从未
+    确认注入过的机器不该被后台程序擅自改动。
+    人的显式动作（`repair`、勾选「启用」）不走这个门槛。
     """
     results = []
     for platform_id in ids:
         module = core.resolve_module(modules, platform_id)
         allow = False
         if repair:
-            if auto_only:
+            if unattended:
                 entry = ctx.platform_config(platform_id)
-                state_entry = ctx.platform_state(platform_id)
-                allow = bool(entry.get("auto_repair")) and bool(state_entry.get("baseline"))
+                allow = bool(entry.get("auto_repair"))
             else:
                 allow = True
-        results.append(core.platform_status(module, ctx, repair=allow))
+        policy = "require" if unattended else "any"
+        results.append(core.platform_status(module, ctx, repair=allow, baseline_policy=policy))
     return results
 
 
@@ -352,7 +353,10 @@ def _dispatch(args: argparse.Namespace, operation: str, as_json: bool) -> int:
         if ctx.dry_run:
             raise core.AutorepairError("内部错误：enable/disable 不应处于 dry-run")
         save_config(ctx)
-        results = collect_status(ctx, modules, ids, repair=False)
+        # 勾选「启用」本身就是人的明确动作，所以启用时顺手把「首次注入」做掉：
+        # 该平台若还没注入（needs_repair），现在就写好，而不是等用户再点一次「修复」。
+        # 停用只改开关，不做任何写入。
+        results = collect_status(ctx, modules, ids, repair=operation == "enable")
         save_state(ctx, results, operation)
         payload = core.build_report(operation, "execute", results)
         emit(payload, as_json=as_json)
@@ -389,7 +393,7 @@ def _dispatch(args: argparse.Namespace, operation: str, as_json: bool) -> int:
         modules = core.discover_platforms(ctx.managed_dir)
         ids = selected_ids(modules, args)
         if args.auto:
-            results = collect_status(ctx, modules, ids, repair=True, auto_only=True)
+            results = collect_status(ctx, modules, ids, repair=True, unattended=True)
         else:
             results = collect_status(ctx, modules, ids, repair=False)
         save_config(ctx)

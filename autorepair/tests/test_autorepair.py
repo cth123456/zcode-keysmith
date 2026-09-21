@@ -283,6 +283,27 @@ class PlatformStatusTests(unittest.TestCase):
             core.platform_status(stub, ctx, repair=False)
             self.assertEqual(ctx.platform_state("stub")["baseline"]["runtime_sha256"], "sha-1")
 
+    def test_unattended_policy_blocks_first_injection(self) -> None:
+        """无人值守：没有基线就不许写，并在 detail 里说明该怎么办。"""
+        with tempfile.TemporaryDirectory() as tmp:
+            ctx = self._ctx(Path(tmp), dry_run=False)
+            stub = self.Stub(core.STATE_NEEDS_REPAIR)
+            result = core.platform_status(stub, ctx, repair=True, baseline_policy="require")
+            self.assertEqual(stub.calls["repair"], 0)
+            self.assertEqual(result["state"], core.STATE_NEEDS_REPAIR)
+            self.assertIn("从未确认注入过", result["detail"])
+            self.assertIn("repair --platform", result["detail"])
+
+    def test_explicit_policy_injects_without_baseline(self) -> None:
+        """人的显式动作（repair / 勾选启用）：没有基线也要真的注入。"""
+        with tempfile.TemporaryDirectory() as tmp:
+            ctx = self._ctx(Path(tmp), dry_run=False)
+            stub = self.Stub(core.STATE_NEEDS_REPAIR)
+            result = core.platform_status(stub, ctx, repair=True, baseline_policy="any")
+            self.assertEqual(stub.calls["repair"], 1)
+            self.assertTrue(result["repaired"])
+            self.assertEqual(result["state"], core.STATE_OK)
+
 
 class CliGateTests(unittest.TestCase):
     """The unattended path through the real CLI and the real drop-in loader."""
@@ -379,6 +400,19 @@ class CliGateTests(unittest.TestCase):
         self.assertEqual(self._calls().get("repair"), 1)
         self.assertEqual(self._calls().get("verify"), 1)
         self.assertEqual(self._row(payload)["state"], core.STATE_OK)
+
+    def test_enable_injects_immediately(self) -> None:
+        """勾选「启用」是人的明确动作：不该停在"开了但没生效"。"""
+        self._write_config(auto_repair=False)
+        payload = self._run("enable", "--platform", "stub")
+        self.assertEqual(self._calls().get("repair"), 1)
+        self.assertEqual(self._row(payload)["state"], core.STATE_OK)
+
+    def test_disable_only_flips_the_switch(self) -> None:
+        self._write_config(auto_repair=False)
+        payload = self._run("disable", "--platform", "stub")
+        self.assertEqual(self._calls().get("repair"), None)
+        self.assertEqual(self._row(payload)["state"], core.STATE_DISABLED)
 
 
 class AgentCommandTests(unittest.TestCase):

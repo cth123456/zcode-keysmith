@@ -310,8 +310,17 @@ def platform_status(
     ctx: PlatformContext,
     *,
     repair: bool = False,
+    baseline_policy: str = "any",
 ) -> dict[str, Any]:
-    """Run one platform through detect -> probe -> (repair) -> verify."""
+    """Run one platform through detect -> probe -> (repair) -> verify.
+
+    baseline_policy 只决定「什么情况下允许写盘」：
+
+    - ``any``（默认）：该平台失效（needs_repair）就修。用于人的显式动作
+      （``repair``，以及 ``enable`` 的首次注入——勾选启用本身就表达了明确意图）。
+    - ``require``：还要求该平台此前**已经确认注入过**（有基线）。用于无人值守自愈：
+      一台从未确认注入过的机器不该被后台程序擅自改动。
+    """
     platform_id = str(getattr(module, "PLATFORM_ID"))
     label = str(getattr(module, "PLATFORM_LABEL", platform_id))
     entry = ctx.platform_config(platform_id)
@@ -375,9 +384,19 @@ def platform_status(
     )
     result["state_label"] = STATE_LABELS.get(result["state"], result["state"])
     baseline = state_entry.get("baseline") or {}
+    has_baseline = bool(baseline)
     # Repair only when the probe says the layout is recognised.  STATE_UNSUPPORTED
     # means the anchors moved and we must stop rather than guess.
-    if repair and result["state"] == STATE_NEEDS_REPAIR:
+    allow_repair = repair and result["state"] == STATE_NEEDS_REPAIR
+    if allow_repair and baseline_policy == "require" and not has_baseline:
+        # 无人值守路径：只有曾经确认注入过的平台才允许自动写回。
+        allow_repair = False
+        result["detail"] = (
+            f"{result['detail']}；该平台从未确认注入过，无人值守不会自动写入——"
+            "请在破甲层点一次「修复」，或在命令行执行 repair --platform "
+            f"{platform_id} --yes"
+        )
+    if allow_repair:
         actions, ok, detail, warnings = _run_repair(module, ctx, probe)
         result["actions"] = actions
         result["warnings"].extend(warnings)
