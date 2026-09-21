@@ -11,6 +11,7 @@ Run: python3 -m unittest discover -s autorepair/tests -v
 
 from __future__ import annotations
 
+import importlib.util
 import json
 import subprocess
 import sys
@@ -378,6 +379,72 @@ class CliGateTests(unittest.TestCase):
         self.assertEqual(self._calls().get("repair"), 1)
         self.assertEqual(self._calls().get("verify"), 1)
         self.assertEqual(self._row(payload)["state"], core.STATE_OK)
+
+
+class AgentCommandTests(unittest.TestCase):
+    """LaunchAgent 只做检测：macOS 应用管理不允许 launchd 写别的 App 包。"""
+
+    @staticmethod
+    def _cli():
+        spec = importlib.util.spec_from_file_location("autorepair_cli_for_test", CLI)
+        module = importlib.util.module_from_spec(spec)
+        sys.modules["autorepair_cli_for_test"] = module
+        spec.loader.exec_module(module)
+        return module
+
+    def test_detect_only_is_the_default_command(self) -> None:
+        cli = self._cli()
+        ctx = make_ctx(Path("/tmp/agent"), dry_run=True, config={"platforms": {}})
+        argv = cli.render_agent_command(ctx)
+        self.assertIn("check", argv)
+        self.assertNotIn("--auto", argv)
+        self.assertIn("--json", argv)
+
+    def test_auto_repair_can_be_opted_in(self) -> None:
+        cli = self._cli()
+        ctx = make_ctx(
+            Path("/tmp/agent"), dry_run=True, config={"platforms": {}, "agent": {"detect_only": False}}
+        )
+        self.assertIn("--auto", cli.render_agent_command(ctx))
+
+
+class StatusSnapshotTests(unittest.TestCase):
+    """GUI 只读快照：字段齐全，且不因为缺字段就崩。"""
+
+    def test_snapshot_carries_enabled_and_auto_repair(self) -> None:
+        snapshot = core.status_snapshot(
+            [
+                {
+                    "id": "zcode",
+                    "label": "ZCode",
+                    "enabled": True,
+                    "auto_repair": True,
+                    "state": core.STATE_OK,
+                    "state_label": core.STATE_LABELS[core.STATE_OK],
+                    "detail": "注入有效",
+                }
+            ],
+            "check",
+        )
+        self.assertEqual(snapshot["schema"], core.STATUS_SCHEMA)
+        self.assertEqual(snapshot["platforms"][0]["auto_repair"], True)
+        self.assertEqual(snapshot["exit_status"], 0)
+        self.assertEqual(snapshot["summary"], "ZCode：已注入")
+
+    def test_snapshot_flags_attention(self) -> None:
+        snapshot = core.status_snapshot(
+            [
+                {
+                    "id": "zcode",
+                    "label": "ZCode",
+                    "enabled": True,
+                    "state": core.STATE_NEEDS_REPAIR,
+                    "state_label": core.STATE_LABELS[core.STATE_NEEDS_REPAIR],
+                }
+            ],
+            "check",
+        )
+        self.assertEqual(snapshot["exit_status"], 1)
 
 
 if __name__ == "__main__":

@@ -132,7 +132,10 @@ def emit(payload: dict[str, object], *, as_json: bool) -> None:
 
 def render_agent_command(ctx: core.PlatformContext) -> list[str]:
     script = Path(__file__).resolve()
-    argv = [sys.executable or "/usr/bin/python3", str(script), "check", "--auto", "--json"]
+    argv = [sys.executable or "/usr/bin/python3", str(script), "check"]
+    if not bool((ctx.config.get("agent") or {}).get("detect_only", True)):
+        argv.append("--auto")
+    argv.append("--json")
     if ctx.managed_dir != core.DEFAULT_MANAGED_DIR:
         argv.extend(["--managed-dir", str(ctx.managed_dir)])
     return argv

@@ -278,6 +278,12 @@ def repair(ctx: PlatformContext, probe: dict[str, Any]) -> dict[str, Any]:
         blockers = result.get("blockers") or []
         reason = "；".join(str(item) for item in blockers) or result.get("error") or "未知原因"
         detail = f"打补丁未成功：{reason}"
+        if "not permitted" in reason.lower() or "eperm" in reason.lower():
+            detail += (
+                "。当前上下文没有修改 App 包的权限：macOS 的应用管理保护不允许 launchd / 后台任务"
+                "写别的 App 包（同一用户从终端或 GUI 里跑则正常）。请在 Bar Control 破甲层或"
+                "发布管理中心里执行修复——首次会弹一次系统授权，批准后即可自动完成。"
+            )
     return {"ok": ok, "actions": _actions_from(result), "detail": detail}
 
 

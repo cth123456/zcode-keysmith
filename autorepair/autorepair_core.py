@@ -37,6 +37,7 @@ STATUS_FIELDS = (
     "state_label",
     "injected",
     "anchors_ok",
+    "baseline_ready",
     "app_version",
     "detail",
     "runtime_path",
@@ -183,6 +184,10 @@ def default_config(managed_dir: Path) -> dict[str, Any]:
         "agent": {
             "interval_seconds": 900,
             "watch_runtime": True,
+            # macOS 的应用管理保护（TCC App Management）不允许 launchd 任务写别的
+            # App 包，所以定时任务只做「检测 + 报告」；真正重打补丁交给有该权限的
+            # GUI 上下文（Bar Control 破甲层 / 发布管理中心一键更新）。
+            "detect_only": True,
         },
         "recent_limit": 20,
     }
@@ -321,6 +326,7 @@ def platform_status(
         "state_label": STATE_LABELS[STATE_DISABLED if not enabled else STATE_ERROR],
         "injected": False,
         "anchors_ok": False,
+        "baseline_ready": bool(state_entry.get("baseline")),
         "installed": False,
         "app_version": state_entry.get("last_version") or "",
         "runtime_path": "",
