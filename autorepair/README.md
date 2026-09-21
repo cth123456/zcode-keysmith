@@ -43,6 +43,7 @@ Codex 默认关闭且默认不自动修复，因为它**整体替换**内置指�
 ./autorepair/keysmith-autorepair.py platforms --json
 
 # 定时/事件自检（LaunchAgent：登录即跑一次，之后每 900 秒一次，并在 ZCode 运行期文件或 codex 配置变化时立即触发）
+# 默认只检测不写入——原因见下面「谁能写 App 包」
 ./autorepair/keysmith-autorepair.py install-agent --yes
 ./autorepair/keysmith-autorepair.py uninstall-agent --yes
 ```
@@ -51,12 +52,34 @@ Codex 默认关闭且默认不自动修复，因为它**整体替换**内置指�
 
 退出码：`0` 无待办，`1` 有平台需要处理（失效/需适配/失败），`2` 用法或配置错误。
 
+## 谁能写 App 包：为什么自愈由 GUI 触发
+
+实测（2026-09-21，macOS 27，同一用户 501、同一个 `/usr/bin/python3`、同一个脚本、同一个目录）：
+
+| 上下文 | 在 `ZCode.app/.../glm/` 里建临时文件 | 原地重写 `zcode.cjs` |
+| --- | --- | --- |
+| launchd 任务（`launchctl bootstrap` + `kickstart`） | ✗ `EPERM` | ✗ `EPERM` |
+| 用户 shell（由已授权的 GUI App 会话派生） | ✓ | ✓ |
+
+两者 `os.access(dir, W_OK)` 都返回 True，目录属主也是本人，所以这不是普通权限问题：这是 macOS 的
+**应用管理保护（TCC App Management）**——修改别的 App 包需要「责任 App」获得该权限，而 launchd 任务
+没有责任 App，拿不到，只能被拒。
+
+结论落在设计上：
+
+- **LaunchAgent 只检测**（`agent.detect_only` 默认 `true`，跑 `check --json`）：它的写入范围只有
+  `~/.keysmith-autorepair/`，足够把状态、基线、`status.json` 刷出来，并如实报告「已失效，可修复」。
+- **重打补丁由 GUI 上下文执行**：Bar Control（常驻菜单栏 App，用户启动、有责任 App）在发现
+  `needs_repair` 且满足门槛时会自动修复（首次 macOS 可能弹一次授权）；发布管理中心的「一键更新」同理。
+- 需要让定时任务也尝试写入时，把 `config.json` 的 `agent.detect_only` 设为 `false`——只在你确认该
+  上下文确实有权限时才这么做，否则每次都会得到一条注定失败的记录。
+
 ## 自动修复的两道门槛
 
-无人值守的 `check --auto` 只会在**同时**满足以下条件时写盘：
+无人值守的自愈只会在**同时**满足以下条件时写盘：
 
 1. 该平台 `enabled` 且 `auto_repair` 为真；
-2. 该平台**已经有过一次被确认的注入**（state 里有 baseline）。
+2. 该平台**已经有过一次被确认的注入**（state 里有 baseline，快照里体现为 `baseline_ready`）。
 
 也就是说，一台从未确认注入过的机器不会被自动打补丁——第一次注入必须由人明确触发一次（CLI `repair --yes`，或 Bar Control / 发布管理中心里的「修复」按钮）。
 
@@ -119,7 +142,7 @@ def revert(ctx) -> dict:            # 可选
 
 `ctx` 提供 `managed_dir`、`dry_run`、`config`/`state` 访问器（`platform_config(id)` / `platform_state(id)`）与 `prompt_file(id)`。适配器**必须**遵守 `ctx.dry_run`：计划阶段不许写盘。
 
-## 已知上游问题（不是本层引入）
+## 已知上游问题（已提 issue）
 
 `zcode-keysmith` 的 `verify` 在 runtime-patch 模式下会跑 wrapper smoke 测试，而该测试要让 wrapper 从**已经打过补丁的** App 文件里重新找原始锚点，必然失败：
 
@@ -129,10 +152,12 @@ wrapper smoke failed: Traceback ... RuntimeError: ZCode runtime patch anchor not
 
 上游为此提供了 `--no-smoke`。本层在 runtime-patch 模式下用 `doctor` 的 `runtime.patched` 作为真正判据，并带 `--no-smoke` 调用上游 verify，同时把上游的这条结论作为 `warnings` 如实透出，而不是当成失败。wrapper 在 runtime-patch 模式下并不参与启动，所以这不影响注入本身。
 
+已报告给上游：<https://github.com/Jia-Ethan/zcode-keysmith/issues/32>（含复现步骤、根因与三种建议修法）。
+
 ## 测试
 
 ```bash
 python3 -m unittest discover -s autorepair/tests -v
 ```
 
-覆盖：TOML 顶级键的读/写/改/删（不碰 `[table]` 内的同名键）、Codex 适配器的 detect→probe→repair→verify→revert 全流程、锚点缺失时判定 `unsupported`、`unsupported` 永不被修复、dry-run 不写盘、自动修复的双门槛、以及通过 CLI 子进程验证第三方平台的落盘扩展点。
+覆盖：TOML 顶级键的读/写/改/删（不碰 `[table]` 内的同名键）、Codex 适配器的 detect→probe→repair→verify→revert 全流程、锚点缺失时判定 `unsupported`、`unsupported` 永不被修复、dry-run 不写盘、自动修复的双门槛、LaunchAgent 默认只检测（可显式开启 `--auto`）、GUI 快照字段与 attention 判定，以及通过 CLI 子进程验证第三方平台的落盘扩展点。
