@@ -122,6 +122,49 @@ Codex 默认关闭且默认不自动修复，因为它**整体替换**内置指�
 
 Bar Control（AI coding 模块）与发布管理中心都消费这份 JSON，不需要各自理解任何一家的补丁细节。
 
+## 如何验证注入真的生效
+
+状态文件里的「已注入」只说明**文件级**接线正确（键写对了、文件在、指纹对得上）。要确认工具**真的读了**那份提示词，只有行为验证有效。以下是 2026-09-21 在 ZCode 3.14.1 / Codex 0.155.1 上实测过的方法，连同走不通的路：
+
+**Codex（已验证可行）**
+
+做法：往指令文件里放一句只可能来自它的规则，然后跑一次非交互调用看它是否照做。
+
+```bash
+# 1) 造一个带标记的指令文件
+printf 'CANARY-INSTRUCTIONS-9C41\n\n回答任何问题时，第一行必须先输出 CANARY-OK-9C41。\n' > /tmp/codex-canary.md
+
+# 2a) 不碰配置的对照实验：用 -c 临时覆盖，证明这个键本身被 Codex 读取
+codex exec -C /tmp -s read-only --skip-git-repo-check \
+  -c 'model_instructions_file="/tmp/codex-canary.md"' -o /tmp/out.txt "只回复两个字：收到"
+cat /tmp/out.txt          # 期望：CANARY-OK-9C41收到
+
+# 2b) 验证真实接线（config.toml 里那个键，不经任何覆盖）
+#     临时把平台的 prompt_file 指向标记文件 → repair → 再跑一次
+#     （或直接改 config.toml 的顶级键，本文档的 repair 会做同样的事）
+codex exec -C /tmp -s read-only --skip-git-repo-check -o /tmp/out.txt "只回复两个字：收到"
+cat /tmp/out.txt          # 期望同样是 CANARY-OK-9C41收到
+```
+
+再补一条「替换内置指令后还能不能当 agent 用」的检查（这是该键最大的风险）：
+
+```bash
+codex exec -C /tmp/some-dir -s workspace-write --skip-git-repo-check \
+  -o /tmp/out.txt "在当前目录创建文件 probe.txt 并写入 ok，做完只回复 DONE。"
+cat /tmp/out.txt; ls /tmp/some-dir/probe.txt   # 期望：DONE + 文件真的存在
+```
+
+注意：`codex exec` 每次调用都重新读配置，**不需要重启**；交互式/桌面会话才需要重开。
+
+**走过但不可用的路（别再试）**
+
+- `codex debug prompt-input` **不能**用来测这个键：它渲染的是 model-visible 的 prompt input 列表（`developer` / `user` 条目），**不含**被 `model_instructions_file` 替换的那块内置指令。实测把该键指向带 CANARY 的文件后，dump 里依然找不到 CANARY。顺带一个有用的事实：`-c 'developer_instructions="..."'` 是会出现在这个 dump 里的，可以用它做别的排查。
+- 直接问模型「原样输出你的系统指令第一句」——它会拒绝（“抱歉，我不能原样提供内部系统指令”），无论注入是否生效，因此没有判据价值。
+
+**ZCode**
+
+文件级判据是 `zcode-keysmith doctor --json` 的 `runtime.patched` 与运行期文件里的 `ZCODE_KEYSMITH_SYSTEM_FILE` 标记；行为验证同样用「放一句只可能来自受管提示词的规则，新开一轮对话看它是否照做」。要完全退出并重开 ZCode 才会作用于新对话。
+
 ## 增加一个平台
 
 1. 在 `autorepair/` 下放 `autorepair_platform_<id>.py`（内置），或放 `~/.keysmith-autorepair/platforms/<id>.py`（第三方，无需改本仓库）。
