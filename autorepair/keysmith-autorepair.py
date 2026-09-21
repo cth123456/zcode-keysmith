@@ -221,10 +221,17 @@ def save_config(ctx: core.PlatformContext) -> None:
         core.write_json_atomic(ctx.config_path, ctx.config)
 
 
-def save_state(ctx: core.PlatformContext) -> None:
+def save_state(
+    ctx: core.PlatformContext,
+    platforms: list[dict[str, object]] | None = None,
+    operation: str = "",
+) -> None:
+    """Persist state and refresh the compact snapshot GUI clients read."""
     if ctx.state_path is not None:
         ctx.state["updated_at"] = core.now_iso()
         core.write_json_atomic(ctx.state_path, ctx.state)
+    if platforms is not None and not ctx.dry_run:
+        core.write_status_snapshot(ctx.managed_dir, platforms, operation)
 
 
 def _common_flags() -> argparse.ArgumentParser:
@@ -267,7 +274,9 @@ def build_parser() -> argparse.ArgumentParser:
 
     enable = sub.add_parser("enable", parents=[_common_flags()], help="Enable tracking/repair for a platform")
     enable.add_argument("--platform", action="append", required=True)
-    enable.add_argument("--auto-repair", dest="auto_repair", action="store_true", default=None)
+    auto = enable.add_mutually_exclusive_group()
+    auto.add_argument("--auto-repair", dest="auto_repair", action="store_true", default=None)
+    auto.add_argument("--no-auto-repair", dest="auto_repair", action="store_false", default=None)
 
     disable = sub.add_parser("disable", parents=[_common_flags()], help="Disable tracking/repair for a platform")
     disable.add_argument("--platform", action="append", required=True)
@@ -341,8 +350,7 @@ def _dispatch(args: argparse.Namespace, operation: str, as_json: bool) -> int:
             raise core.AutorepairError("内部错误：enable/disable 不应处于 dry-run")
         save_config(ctx)
         results = collect_status(ctx, modules, ids, repair=False)
-        if not ctx.dry_run:
-            save_state(ctx)
+        save_state(ctx, results, operation)
         payload = core.build_report(operation, "execute", results)
         emit(payload, as_json=as_json)
         return 0
@@ -382,7 +390,7 @@ def _dispatch(args: argparse.Namespace, operation: str, as_json: bool) -> int:
         else:
             results = collect_status(ctx, modules, ids, repair=False)
         save_config(ctx)
-        save_state(ctx)
+        save_state(ctx, results, operation)
         payload = core.build_report(operation, "execute", results)
         payload["exit_status"] = core.exit_code_for(results)
         emit(payload, as_json=as_json)
@@ -412,7 +420,7 @@ def _dispatch(args: argparse.Namespace, operation: str, as_json: bool) -> int:
                     }
                 )
         if not ctx.dry_run:
-            save_state(ctx)
+            save_state(ctx, results, operation)
         payload = core.build_report(operation, "preview" if ctx.dry_run else "execute", results)
         payload["exit_status"] = core.exit_code_for(results)
         emit(payload, as_json=as_json)

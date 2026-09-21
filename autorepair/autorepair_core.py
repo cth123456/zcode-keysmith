@@ -25,6 +25,25 @@ from typing import Any, Iterator
 JSON_SCHEMA = "keysmith-autorepair/v1"
 CONFIG_SCHEMA = "keysmith-autorepair/config/v1"
 STATE_SCHEMA = "keysmith-autorepair/state/v1"
+STATUS_SCHEMA = "keysmith-autorepair/status/v1"
+STATUS_FILE_NAME = "status.json"
+STATUS_FIELDS = (
+    "id",
+    "label",
+    "enabled",
+    "auto_repair",
+    "installed",
+    "state",
+    "state_label",
+    "injected",
+    "anchors_ok",
+    "app_version",
+    "detail",
+    "runtime_path",
+    "last_check",
+    "last_repair",
+    "repaired",
+)
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
 DEFAULT_MANAGED_DIR = Path.home() / ".keysmith-autorepair"
@@ -297,6 +316,7 @@ def platform_status(
         "id": platform_id,
         "label": label,
         "enabled": enabled,
+        "auto_repair": bool(entry.get("auto_repair")),
         "state": STATE_DISABLED if not enabled else STATE_ERROR,
         "state_label": STATE_LABELS[STATE_DISABLED if not enabled else STATE_ERROR],
         "injected": False,
@@ -483,3 +503,31 @@ def exit_code_for(platforms: list[dict[str, Any]]) -> int:
     if states & {STATE_UNSUPPORTED, STATE_ERROR, STATE_NEEDS_REPAIR}:
         return 1
     return 0
+
+
+def status_snapshot(platforms: list[dict[str, Any]], operation: str) -> dict[str, Any]:
+    """Compact read-only snapshot for GUI consumers (Bar Control).
+
+    It is written next to state.json so a menu-bar app never has to spawn a
+    process or re-hash a 14 MB runtime file just to draw a status chip.
+    """
+    return {
+        "schema": STATUS_SCHEMA,
+        "generated_at": now_iso(),
+        "operation": operation,
+        "summary": summarize(platforms),
+        "exit_status": exit_code_for(platforms),
+        "platforms": [
+            {key: item.get(key) for key in STATUS_FIELDS}
+            for item in platforms
+            if isinstance(item, dict) and item.get("id")
+        ],
+    }
+
+
+def write_status_snapshot(managed_dir: Path, platforms: list[dict[str, Any]], operation: str) -> None:
+    try:
+        write_json_atomic(managed_dir / STATUS_FILE_NAME, status_snapshot(platforms, operation))
+    except OSError:
+        # The GUI snapshot is a convenience; it must never fail a real check.
+        pass
