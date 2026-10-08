@@ -7,6 +7,8 @@ export class ContractError extends Error {
     super(message);
     this.name = "ContractError";
     this.output = output;
+    this.stdout = String(output.stdout ?? "");
+    this.stderr = String(output.stderr ?? "");
     this.exitCode = output.exit_code ?? null;
     this.timedOut = Boolean(output.timed_out);
   }

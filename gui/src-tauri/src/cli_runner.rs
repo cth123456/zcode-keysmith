@@ -9,6 +9,7 @@ use std::path::{Path, PathBuf};
 use std::process::Stdio;
 use tokio::io::{AsyncRead, AsyncReadExt};
 use tokio::process::{Child, Command};
+use tokio::sync::watch;
 use tokio::task::JoinHandle;
 use tokio::time::{timeout, Duration};
 
@@ -23,7 +24,7 @@ const OUTPUT_ABORT_GRACE_MS: u64 = 100;
 const SIDECAR_BASENAME: &str = "zcode-keysmith-cli";
 const SCRIPT_NAME: &str = "zcode-keysmith.py";
 
-#[derive(Debug, Default)]
+#[derive(Clone, Debug, Default)]
 struct CapturedOutput {
     bytes: Vec<u8>,
     truncated: bool,
@@ -32,7 +33,7 @@ struct CapturedOutput {
 
 #[derive(Debug)]
 enum ReadTaskError {
-    Timeout,
+    Timeout(CapturedOutput, CapturedOutput),
     Join(String),
 }
 
@@ -127,26 +128,46 @@ async fn run_invocation(
             )
         })?;
 
+    // Retain the leader pid before wait(). After the child reaps, child.id()
+    // is gone; descendants can still hold the inherited pipes.
+    let process_id = child.id();
     let stdout_reader = child.stdout.take().expect("stdout pipe");
     let stderr_reader = child.stderr.take().expect("stderr pipe");
+    let (stdout_slot, stdout_snapshot) = watch::channel(CapturedOutput::default());
+    let (stderr_slot, stderr_snapshot) = watch::channel(CapturedOutput::default());
     let read_task = tokio::spawn(async move {
-        tokio::join!(read_capped(stdout_reader), read_capped(stderr_reader))
+        tokio::join!(
+            read_capped(stdout_reader, stdout_slot),
+            read_capped(stderr_reader, stderr_slot)
+        )
     });
 
     let exit = match timeout(limit, child.wait()).await {
         Ok(Ok(status)) => status.code().unwrap_or(-1),
         Ok(Err(error)) => {
             terminate_process_tree(&mut child).await;
-            let _ =
-                finish_read_task(read_task, Duration::from_millis(OUTPUT_DRAIN_TIMEOUT_MS)).await;
+            let _ = finish_read_task(
+                read_task,
+                Duration::from_millis(OUTPUT_DRAIN_TIMEOUT_MS),
+                &stdout_snapshot,
+                &stderr_snapshot,
+            )
+            .await;
             return Err(format!("等待 CLI 进程失败: {error}"));
         }
         Err(_) => {
             terminate_process_tree(&mut child).await;
-            let (stdout, stderr) =
-                finish_read_task(read_task, Duration::from_millis(OUTPUT_DRAIN_TIMEOUT_MS))
-                    .await
-                    .unwrap_or_default();
+            let (stdout, stderr) = finish_read_task(
+                read_task,
+                Duration::from_millis(OUTPUT_DRAIN_TIMEOUT_MS),
+                &stdout_snapshot,
+                &stderr_snapshot,
+            )
+            .await
+            .unwrap_or_else(|error| match error {
+                ReadTaskError::Timeout(stdout, stderr) => (stdout, stderr),
+                ReadTaskError::Join(_) => Default::default(),
+            });
             return Ok(CliOutput {
                 stdout: String::from_utf8_lossy(&stdout.bytes).into_owned(),
                 stderr: String::from_utf8_lossy(&stderr.bytes).into_owned(),
@@ -156,13 +177,30 @@ async fn run_invocation(
         }
     };
 
-    let (stdout, stderr) =
-        finish_read_task(read_task, Duration::from_millis(OUTPUT_DRAIN_TIMEOUT_MS))
-            .await
-            .map_err(|error| match error {
-                ReadTaskError::Timeout => "读取 CLI 输出超时".to_string(),
-                ReadTaskError::Join(error) => format!("读取 CLI 输出任务失败: {error}"),
-            })?;
+    let (stdout, stderr) = match finish_read_task(
+        read_task,
+        Duration::from_millis(OUTPUT_DRAIN_TIMEOUT_MS),
+        &stdout_snapshot,
+        &stderr_snapshot,
+    )
+    .await
+    {
+        Ok(output) => output,
+        Err(error) => {
+            // The leader may have exited while descendants still own its pipes.
+            // Kill the saved process group rather than consulting child.id().
+            kill_saved_process_group(process_id);
+            return match error {
+                ReadTaskError::Timeout(stdout, stderr) => Ok(CliOutput {
+                    stdout: String::from_utf8_lossy(&stdout.bytes).into_owned(),
+                    stderr: String::from_utf8_lossy(&stderr.bytes).into_owned(),
+                    exit_code: -1,
+                    timed_out: true,
+                }),
+                ReadTaskError::Join(error) => Err(format!("读取 CLI 输出任务失败: {error}")),
+            };
+        }
+    };
     validate_captured_output(&stdout, &stderr)?;
     Ok(CliOutput {
         stdout: String::from_utf8_lossy(&stdout.bytes).into_owned(),
@@ -178,16 +216,45 @@ async fn run_invocation(
 async fn finish_read_task(
     mut read_task: JoinHandle<(CapturedOutput, CapturedOutput)>,
     drain_limit: Duration,
+    stdout_snapshot: &watch::Receiver<CapturedOutput>,
+    stderr_snapshot: &watch::Receiver<CapturedOutput>,
 ) -> Result<(CapturedOutput, CapturedOutput), ReadTaskError> {
     match timeout(drain_limit, &mut read_task).await {
         Ok(Ok(output)) => Ok(output),
         Ok(Err(error)) => Err(ReadTaskError::Join(error.to_string())),
         Err(_) => {
             read_task.abort();
-            let _ = timeout(Duration::from_millis(OUTPUT_ABORT_GRACE_MS), read_task).await;
-            Err(ReadTaskError::Timeout)
+            let captured = timeout(Duration::from_millis(OUTPUT_ABORT_GRACE_MS), read_task)
+                .await
+                .ok()
+                .and_then(Result::ok);
+            // Abort drops the in-flight read. The watch slots still hold every
+            // byte published before the deadline.
+            let (stdout, stderr) = captured.unwrap_or_else(|| {
+                (
+                    stdout_snapshot.borrow().clone(),
+                    stderr_snapshot.borrow().clone(),
+                )
+            });
+            Err(ReadTaskError::Timeout(stdout, stderr))
         }
     }
+}
+
+#[cfg(unix)]
+fn kill_saved_process_group(process_id: Option<u32>) {
+    if let Some(pid) = process_id.and_then(|pid| i32::try_from(pid).ok()) {
+        unsafe {
+            // Negative pid is the group the child led. The group outlives the
+            // leader while a member still holds an inherited pipe.
+            libc::kill(-pid, libc::SIGKILL);
+        }
+    }
+}
+
+#[cfg(not(unix))]
+fn kill_saved_process_group(process_id: Option<u32>) {
+    let _ = process_id;
 }
 
 #[cfg(unix)]
@@ -262,7 +329,7 @@ fn validate_captured_output(
     }
 }
 
-async fn read_capped<R>(mut reader: R) -> CapturedOutput
+async fn read_capped<R>(mut reader: R, slot: watch::Sender<CapturedOutput>) -> CapturedOutput
 where
     R: AsyncRead + Unpin,
 {
@@ -286,7 +353,9 @@ where
         if read > remaining {
             captured.truncated = true;
         }
+        let _ = slot.send(captured.clone());
     }
+    let _ = slot.send(captured.clone());
     captured
 }
 
@@ -551,6 +620,62 @@ mod tests {
 
     #[cfg(unix)]
     #[tokio::test]
+    async fn timeout_covers_pipes_after_leader_exit() {
+        let invocation = CliInvocation {
+            path: PathBuf::from("/bin/sh"),
+            program: PathBuf::from("/bin/sh"),
+            prefix_args: vec![
+                OsString::from("-c"),
+                // The sleeper inherits the shell's stdout. After the shell
+                // exits, that pipe stays open and the group still exists, so
+                // the saved leader pid can SIGKILL the whole group.
+                // Print the sleeper and exit at once. It keeps the inherited
+                // stdout open, so the drain outlives the leader and the saved
+                // process group is what has to die. Do not sleep in the shell:
+                // that trips the child-wait timeout instead.
+                OsString::from("sleep 30 & echo $! $$ $(ps -o pgid= -p $!); exit 0"),
+            ],
+            runtime: CliRuntime::Executable,
+        };
+        let output = timeout(
+            Duration::from_secs(1),
+            run_invocation(&invocation, &[], Duration::from_millis(100)),
+        )
+        .await
+        .expect("pipe read exceeded deadline")
+        .expect("invocation result");
+        assert!(output.timed_out);
+        let mut fields = output.stdout.split_whitespace();
+        let descendant: i32 = fields
+            .next()
+            .expect("descendant pid")
+            .parse()
+            .expect("descendant pid");
+        let leader: i32 = fields
+            .next()
+            .expect("leader pid")
+            .parse()
+            .expect("leader pid");
+        let group: i32 = fields
+            .next()
+            .expect("descendant pgid")
+            .parse()
+            .expect("descendant pgid");
+        // The sleeper has to still be in the leader's group. Job control can
+        // move it out, and then this kill would not be the one under test.
+        assert_eq!(group, leader);
+        for _ in 0..40 {
+            if unsafe { libc::kill(descendant, 0) } != 0 {
+                return;
+            }
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+        let _ = unsafe { libc::kill(descendant, libc::SIGKILL) };
+        panic!("descendant process survived pipe-hang timeout");
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
     async fn timeout_terminates_descendant_processes() {
         let invocation = CliInvocation {
             path: PathBuf::from("/bin/sh"),
@@ -599,17 +724,24 @@ mod tests {
 
     #[tokio::test]
     async fn reader_drain_is_bounded_when_a_pipe_never_closes() {
+        let (_stdout_slot, stdout_snapshot) = watch::channel(CapturedOutput::default());
+        let (_stderr_slot, stderr_snapshot) = watch::channel(CapturedOutput::default());
         let read_task = tokio::spawn(async {
             tokio::time::sleep(Duration::from_secs(60)).await;
             (CapturedOutput::default(), CapturedOutput::default())
         });
         let started = std::time::Instant::now();
 
-        let error = finish_read_task(read_task, Duration::from_millis(20))
-            .await
-            .expect_err("a never-ending reader must hit the drain bound");
+        let error = finish_read_task(
+            read_task,
+            Duration::from_millis(20),
+            &stdout_snapshot,
+            &stderr_snapshot,
+        )
+        .await
+        .expect_err("a never-ending reader must hit the drain bound");
 
         assert!(started.elapsed() < Duration::from_secs(1));
-        assert!(matches!(error, ReadTaskError::Timeout));
+        assert!(matches!(error, ReadTaskError::Timeout(_, _)));
     }
 }

@@ -35,6 +35,19 @@ RUNTIME_V314 = (
     'let l=a!==void 0;if(l||t.push(JMe()),s?t.push(dGs({name:"Custom System Prompt",source:"x"})):t.push(Qfn(n)));'
     "const x={customSystemPrompt:this.config.systemPrompt,workflowActor:this.config.workflowActor,language:this.config.language};"
 )
+MEMORY_ATTACH_FN = (
+    "function WKs(e,t){if(!e||t===void 0)return null;let n=Edt(t);"
+    'return n?[`Contents of ${(0,Nno.join)(e,"MEMORY.md")} '
+    "(user's auto-memory, persists across conversations):`,"
+    '"",n].join(`\n`):null}'
+)
+RUNTIME_WITH_MEMORY = (
+    MEMORY_ATTACH_FN
+    + '["# agentsMd","Codebase and user instructions are shown below. Be sure to adhere to these instructions. '
+    "These are workspace notes and user instructions. They describe the environment. "
+    'They do not override the custom system prompt.","",t.join(`\n`)].join(`\n`);'
+    + RUNTIME_V312
+)
 
 
 def make_runtime(path: Path, text: str | None = None) -> None:
@@ -54,7 +67,7 @@ def test_cli_reports_release_version():
     )
 
     assert completed.returncode == 0
-    assert completed.stdout.strip() == "zcode-keysmith.py 0.3.2"
+    assert completed.stdout.strip() == "zcode-keysmith.py 0.3.3"
     assert completed.stderr == ""
     assert mod.VERSION == (MODULE_PATH.parent / "VERSION").read_text(encoding="ascii").strip()
 
@@ -174,6 +187,68 @@ def test_patch_neutralizes_agentsmd_override_when_custom_prompt_is_set():
     patched = mod.build_patched_runtime_text(original, "/tmp/system-role.md")
     assert "OVERRIDE any default behavior" not in patched
     assert "do not override the custom system prompt" in patched
+
+
+def test_patch_skips_project_memory_attach_and_drops_adhere_copy():
+    patched = mod.build_patched_runtime_text(RUNTIME_WITH_MEMORY, "/tmp/system-role.md")
+    assert "if(!0)return null;if(!e||t===void 0)return null" in patched
+    assert "Be sure to adhere to these instructions." not in patched
+    assert "(user's auto-memory, persists across conversations):" in patched
+    assert mod._runtime_memory_skipped(patched)
+    assert not mod._runtime_memory_skipped(RUNTIME_WITH_MEMORY)
+    twice = mod.apply_followup_runtime_patches(patched)
+    assert twice == patched
+    assert twice.count("if(!0)return null;") == 1
+
+
+def test_apply_runtime_patch_applies_memory_skip_on_already_managed_runtime(tmp_path):
+    runtime = tmp_path / "zcode.cjs"
+    managed = (
+        MEMORY_ATTACH_FN
+        + "customSystemPrompt:(()=>{try{let e=process.env.ZCODE_KEYSMITH_SYSTEM_FILE||\"/tmp/system-role.md\";"
+        "let t=require(\"node:fs\");if(t.existsSync(e)){let x=t.readFileSync(e,\"utf8\");if(x&&x.trim())return x}}"
+        "catch{}return this.config.systemPrompt})()"
+    )
+    runtime.write_text(managed, encoding="utf-8")
+    plan = mod.InstallPlan(
+        paths=mod.build_paths(tmp_path / "managed"),
+        source_system_file=tmp_path / "source.md",
+        zcode_runtime=runtime,
+        node_command=tmp_path / "node",
+        activate=False,
+        injection_mode=mod.INJECTION_RUNTIME_PATCH,
+    )
+    backups = mod.apply_runtime_patch(plan)
+    assert backups == []
+    patched = runtime.read_text(encoding="utf-8")
+    assert mod._runtime_memory_skipped(patched)
+    assert "ZCODE_KEYSMITH_SYSTEM_FILE" in patched
+
+
+@pytest.mark.skipif(shutil.which("node") is None, reason="Node.js is needed to execute JS fixture")
+def test_memory_attach_returns_null_after_patch(tmp_path):
+    runtime = (
+        "function Edt(t){return t}"
+        "function Nno(){}"
+        "Nno.join=(e,n)=>e+'/'+n;"
+        + MEMORY_ATTACH_FN
+        + "module.exports=WKs;"
+        "function unused(){const x={customSystemPrompt:this.config.systemPrompt,language:this.config.language};}"
+    )
+    patched_path = tmp_path / "runtime.cjs"
+    patched_path.write_text(mod.build_patched_runtime_text(runtime, str(tmp_path / "system.md")), encoding="utf-8")
+    node = shutil.which("node")
+    assert node is not None
+    check = subprocess.run([node, "--check", str(patched_path)], capture_output=True, text=True)
+    assert check.returncode == 0, check.stderr
+    result = subprocess.run(
+        [node, "-e", "const fn=require(process.argv[1]); console.log(JSON.stringify(fn('/tmp','hello')))", str(patched_path)],
+        text=True,
+        capture_output=True,
+        check=False,
+    )
+    assert result.returncode == 0, result.stderr
+    assert result.stdout.strip() == "null"
 
 
 def test_apply_runtime_patch_applies_followups_on_already_managed_runtime(tmp_path):
@@ -478,6 +553,8 @@ def test_doctor_reports_state_without_secret_values(tmp_path, capsys, monkeypatc
     assert code == 0
     assert "zcode-keysmith doctor" in out
     assert "zcode_runtime_patchable: true" in out
+    assert "runtime_memory_skipped: false" in out
+    assert "zcode_memory_index_lexicon:" not in out
     assert "api_key: not read or stored" in out
     assert "TEST_OPENAI_KEY_REDACTED" not in out
 
@@ -1254,6 +1331,8 @@ def test_macos_uninstall_rolls_back_environment_and_files_on_unset_failure(tmp_p
 
     def fake_run(command, **kwargs):
         nonlocal unset_calls
+        if command[1] in {"bootout", "bootstrap"}:
+            return subprocess.CompletedProcess(command, 0, "", "")
         if command[1] == "getenv":
             value = current.get(command[2])
             return subprocess.CompletedProcess(command, 0 if value is not None else 1, f"{value}\n" if value else "", "")
@@ -1296,6 +1375,8 @@ def test_macos_uninstall_keeps_backups_when_environment_rollback_is_incomplete(t
 
     def fake_run(command, **kwargs):
         nonlocal unset_calls, restore_calls
+        if command[1] in {"bootout", "bootstrap"}:
+            return subprocess.CompletedProcess(command, 0, "", "")
         if command[1] == "getenv":
             value = current.get(command[2])
             return subprocess.CompletedProcess(command, 0 if value is not None else 1, f"{value}\n" if value else "", "")
@@ -1527,6 +1608,9 @@ def test_json_install_execute_and_doctor(tmp_path, capsys, monkeypatch):
     assert doctor["managed"]["dir"] == str(managed)
     assert doctor["managed"]["wrapper_exists"] is True
     assert doctor["runtime"]["path"] == str(runtime)
+    assert "memory_skipped" in doctor["runtime"]
+    assert isinstance(doctor["runtime"]["memory_skipped"], bool)
+    assert "memory_index_lexicon" not in doctor["runtime"]
     assert doctor["env"]["ZCODE_KEYSMITH_SYSTEM_FILE"]["expected"].endswith("system-role.md")
 
 
@@ -1656,3 +1740,500 @@ def test_wrapper_smoke_converts_timeout_and_start_errors_to_details(tmp_path, mo
     ok, detail = mod.run_wrapper_smoke(paths)
     assert ok is False
     assert detail == "could not start wrapper: missing executable"
+
+
+def _runtime_patch_plan(tmp_path, runtime_text=None, injection_mode=mod.INJECTION_RUNTIME_PATCH):
+    app = tmp_path / "ZCode.app"
+    asar = app / "Contents" / "Resources" / "app.asar"
+    asar.parent.mkdir(parents=True, exist_ok=True)
+    asar.write_bytes(b"ZCODE_AGENT_SERVER_COMMAND\nsupportsStorageStartup\n")
+    runtime = app / "Contents" / "Resources" / "glm" / "zcode.cjs"
+    runtime.parent.mkdir(parents=True, exist_ok=True)
+    make_runtime(runtime, runtime_text)
+    source = tmp_path / "source.md"
+    source.write_text("# managed system\n", encoding="utf-8")
+    node_command = tmp_path / "node"
+    node_command.write_text("#!/bin/sh\n", encoding="utf-8")
+    node_command.chmod(0o755)
+    paths = mod.build_paths(tmp_path / "managed", tmp_path / "agent.plist")
+    plan = mod.InstallPlan(
+        paths=paths,
+        source_system_file=source,
+        zcode_runtime=runtime,
+        node_command=node_command,
+        activate=False,
+        injection_mode=injection_mode,
+    )
+    return plan, runtime, source, node_command
+
+
+def test_wait_for_runtime_settle_times_out_when_file_keeps_changing(tmp_path, monkeypatch):
+    runtime = tmp_path / "zcode.cjs"
+    runtime.write_text("vendor", encoding="utf-8")
+    now = {"t": 0.0}
+    n = {"i": 0}
+
+    def fake_signature(path):
+        n["i"] += 1
+        return (n["i"], n["i"])
+
+    monkeypatch.setattr(mod, "runtime_stat_signature", fake_signature)
+    assert mod.wait_for_runtime_settle(
+        runtime,
+        timeout=1.0,
+        stable_for=3.0,
+        poll=0.5,
+        clock=lambda: now["t"],
+        sleeper=lambda delta: now.__setitem__("t", now["t"] + delta),
+    ) is False
+
+
+def test_wait_for_runtime_settle_accepts_stable_file(tmp_path, monkeypatch):
+    runtime = tmp_path / "zcode.cjs"
+    runtime.write_text("vendor", encoding="utf-8")
+    now = {"t": 0.0}
+    monkeypatch.setattr(mod, "runtime_stat_signature", lambda path: (12, 99))
+    assert mod.wait_for_runtime_settle(
+        runtime,
+        timeout=5.0,
+        stable_for=3.0,
+        poll=0.5,
+        clock=lambda: now["t"],
+        sleeper=lambda delta: now.__setitem__("t", now["t"] + delta),
+    ) is True
+    assert now["t"] >= 3.0
+
+
+def _write_fake_launchctl(bin_dir: Path, *, print_code: int, bootstrap_code: int = 0) -> None:
+    path = bin_dir / "launchctl"
+    path.write_text(
+        "#!/bin/sh\n"
+        "printf '%s\\n' \"$*\" >> \"$LAUNCHCTL_LOG\"\n"
+        "if [ \"$1\" = print ]; then\n"
+        f"  exit {print_code}\n"
+        "fi\n"
+        "if [ \"$1\" = bootstrap ]; then\n"
+        f"  echo 'bootstrap failed' >&2\n"
+        f"  exit {bootstrap_code}\n"
+        "fi\n"
+        "exit 0\n",
+        encoding="utf-8",
+    )
+    path.chmod(0o755)
+
+
+def _run_rearm_script(script: Path, bin_dir: Path) -> tuple[subprocess.CompletedProcess[str], str, str]:
+    log = bin_dir / "launchctl.log"
+    env = os.environ.copy()
+    env["PATH"] = str(bin_dir) + os.pathsep + env.get("PATH", "")
+    env["LAUNCHCTL_LOG"] = str(log)
+    completed = subprocess.run(
+        ["/bin/sh", str(script)],
+        text=True,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        env=env,
+        check=False,
+    )
+    recorded = log.read_text(encoding="utf-8") if log.exists() else ""
+    rearm_log = script.parent.parent / "logs" / "rearm.log"
+    # The rendered script logs next to the managed dir, not next to the fake bin.
+    return completed, recorded, rearm_log.read_text(encoding="utf-8") if rearm_log.is_file() else ""
+
+
+@pytest.mark.skipif(sys.platform == "win32", reason="rearm watchdog is a POSIX launchd script")
+def test_rearm_script_bootstraps_unloaded_watch_agent_and_stays_quiet_when_loaded(tmp_path, monkeypatch):
+    monkeypatch.setattr(mod.platform, "system", lambda: "Darwin")
+    plan, _runtime, _source, _node = _runtime_patch_plan(tmp_path)
+    plan.paths.launch_agent.parent.mkdir(parents=True, exist_ok=True)
+    plan.paths.launch_agent.write_text("plist", encoding="utf-8")
+    script = plan.paths.rearm_script
+    script.parent.mkdir(parents=True, exist_ok=True)
+    script.write_text(mod.render_rearm_script(plan), encoding="utf-8")
+    plist = mod.render_rearm_launch_agent(plan)
+    assert "WatchPaths" not in plist
+    assert plist["StartInterval"] == 60
+    assert plist["ProgramArguments"] == [str(script)]
+    assert "launchctl bootout" not in script.read_text(encoding="utf-8")
+
+    missing = tmp_path / "missing-bin"
+    missing.mkdir()
+    _write_fake_launchctl(missing, print_code=113)
+    completed, recorded, rearm_log = _run_rearm_script(script, missing)
+    assert completed.returncode == 0
+    assert "print gui/" in recorded
+    assert recorded.count("bootstrap ") == 1
+    assert "bootstrapped gui/" in rearm_log
+
+    loaded = tmp_path / "loaded-bin"
+    loaded.mkdir()
+    _write_fake_launchctl(loaded, print_code=0)
+    completed, recorded, _quiet_log = _run_rearm_script(script, loaded)
+    assert completed.returncode == 0
+    assert "print gui/" in recorded
+    assert "bootstrap " not in recorded
+
+    failed = tmp_path / "failed-bin"
+    failed.mkdir()
+    _write_fake_launchctl(failed, print_code=113, bootstrap_code=5)
+    completed, recorded, rearm_log = _run_rearm_script(script, failed)
+    assert completed.returncode == 0
+    assert "bootstrap failed gui/" in rearm_log
+
+
+def test_bootout_removes_rearm_before_the_watch_agent(tmp_path, monkeypatch):
+    monkeypatch.setattr(mod.platform, "system", lambda: "Darwin")
+    monkeypatch.setattr(mod, "launchd_gui_target", lambda label=mod.DEFAULT_LAUNCH_AGENT_LABEL: f"gui/501/{label}")
+    paths = mod.build_paths(tmp_path / "managed", tmp_path / "agent.plist")
+    calls = []
+
+    def fake_run(command, **kwargs):
+        calls.append(command)
+        return subprocess.CompletedProcess(command, 0, "", "")
+
+    notes = mod.bootout_launch_agent(paths, runner=fake_run)
+    assert [command[2] for command in calls] == [
+        "gui/501/com.jia.zcode-keysmith.rearm",
+        "gui/501/com.jia.zcode-keysmith.env",
+    ]
+    assert all(note.endswith(": ok") for note in notes)
+
+
+def test_doctor_json_blocks_when_watch_plist_exists_without_rearm(tmp_path, monkeypatch):
+    monkeypatch.setattr(mod.platform, "system", lambda: "Darwin")
+    monkeypatch.setattr(mod, "launch_agent_loaded", lambda label: "false")
+    plan, runtime, _source, node = _runtime_patch_plan(tmp_path, RUNTIME_V314)
+    plan.paths.managed_dir.mkdir(parents=True)
+    plan.paths.wrapper.parent.mkdir(parents=True, exist_ok=True)
+    plan.paths.system_file.write_text("# managed system\n", encoding="utf-8")
+    plan.paths.config_file.write_text("{}\n", encoding="utf-8")
+    plan.paths.wrapper.write_text("#!/bin/sh\n", encoding="utf-8")
+    plan.paths.env_script.write_text("#!/bin/sh\n", encoding="utf-8")
+    plan.paths.launch_agent.parent.mkdir(parents=True, exist_ok=True)
+    plan.paths.launch_agent.write_text("plist", encoding="utf-8")
+    runtime.write_text(mod.build_patched_runtime_text(RUNTIME_V314, str(plan.paths.system_file)), encoding="utf-8")
+    report = mod.doctor_report(plan.paths, runtime, node)
+    assert report["ok"] is False
+    assert any("rearm LaunchAgent missing" in item for item in report["blockers"])
+
+
+def test_runtime_patch_launch_agent_watches_runtime_and_execs_watch(tmp_path, monkeypatch):
+    monkeypatch.setattr(mod.platform, "system", lambda: "Darwin")
+    plan, runtime, _source, node_command = _runtime_patch_plan(tmp_path)
+    plist = mod.render_launch_agent(plan)
+    env_script = mod.render_env_script(plan)
+    assert plist["WatchPaths"][0] == str(runtime)
+    assert any(str(runtime.parent.parent.parent) == item or item.endswith("ZCode.app") for item in plist["WatchPaths"])
+    assert plist["StartInterval"] == 300
+    assert plist["ProgramArguments"] == [str(plan.paths.env_script)]
+    assert "launchctl setenv ZCODE_KEYSMITH_SYSTEM_FILE" in env_script
+    assert "watch --managed-dir" in env_script
+    assert "--yes" in env_script
+    assert str(runtime) in env_script
+    assert str(node_command) in env_script
+
+
+def test_auto_repatch_skips_already_patched_runtime(tmp_path, monkeypatch):
+    monkeypatch.setattr(mod.platform, "system", lambda: "Darwin")
+    monkeypatch.setattr(mod, "is_zcode_running", lambda: False)
+    monkeypatch.setattr(mod, "wait_for_runtime_settle", lambda *a, **k: True)
+    plan, runtime, source, node = _runtime_patch_plan(tmp_path)
+    plan.paths.managed_dir.mkdir(parents=True)
+    plan.paths.system_file.write_text("# managed system\n", encoding="utf-8")
+    runtime.write_text(mod.build_patched_runtime_text(RUNTIME_V314, str(plan.paths.system_file)), encoding="utf-8")
+    result = mod.run_auto_repatch(plan, yes=True, dry_run_flag=False, restart=False, notifier=lambda *a, **k: False)
+    assert result["status"] == "skipped"
+    doctor = "\n".join(mod.doctor_lines(plan.paths, runtime, node))
+    assert "last_auto_repatch: skip" in doctor
+    assert "last_auto_repatch_status: skipped" in doctor
+
+
+def test_auto_repatch_patches_vendor_runtime_after_update_and_backups_original(tmp_path, monkeypatch):
+    monkeypatch.setattr(mod.platform, "system", lambda: "Darwin")
+    monkeypatch.setattr(mod, "is_zcode_running", lambda: False)
+    monkeypatch.setattr(mod, "wait_for_runtime_settle", lambda *a, **k: True)
+    plan, runtime, source, node = _runtime_patch_plan(tmp_path, RUNTIME_V314)
+    plan.paths.managed_dir.mkdir(parents=True)
+    plan.paths.system_file.write_text("# managed system\n", encoding="utf-8")
+    original = runtime.read_text(encoding="utf-8")
+    result = mod.run_auto_repatch(plan, yes=True, dry_run_flag=False, restart=False, notifier=lambda *a, **k: False)
+    assert result["status"] == "patched"
+    assert result["restarted"] is False
+    patched = runtime.read_text(encoding="utf-8")
+    assert "ZCODE_KEYSMITH_SYSTEM_FILE" in patched
+    backup = Path(result["runtime_original_backup"])
+    assert backup.is_file()
+    assert backup.read_text(encoding="utf-8") == original
+    config = json.loads(plan.paths.config_file.read_text(encoding="utf-8"))
+    assert config["runtime_original_backup"] == str(backup)
+    doctor = json.loads(
+        json.dumps(
+            mod.doctor_report(plan.paths, runtime, node)
+        )
+    )
+    assert doctor["last_auto_repatch"] == "success"
+    assert doctor["last_auto_repatch_status"] == "patched"
+    skip = mod.run_auto_repatch(plan, yes=True, dry_run_flag=False, restart=False, notifier=lambda *a, **k: False)
+    assert skip["status"] == "skipped"
+    later = mod.doctor_report(plan.paths, runtime, node)
+    assert later["last_auto_repatch"] == "success"
+    assert later["last_auto_repatch_status"] == "patched"
+
+
+def test_auto_repatch_unknown_hook_does_not_patch_and_notifies_once(tmp_path, monkeypatch):
+    monkeypatch.setattr(mod.platform, "system", lambda: "Darwin")
+    monkeypatch.setattr(mod, "is_zcode_running", lambda: False)
+    monkeypatch.setattr(mod, "wait_for_runtime_settle", lambda *a, **k: True)
+    plan, runtime, source, node = _runtime_patch_plan(tmp_path, "const x=1;\n")
+    plan.paths.managed_dir.mkdir(parents=True)
+    plan.paths.system_file.write_text("# managed system\n", encoding="utf-8")
+    notices = []
+
+    def fake_notify(title, message):
+        notices.append((title, message))
+        return True
+
+    first = mod.run_auto_repatch(plan, yes=True, dry_run_flag=False, restart=False, notifier=fake_notify)
+    second = mod.run_auto_repatch(plan, yes=True, dry_run_flag=False, restart=False, notifier=fake_notify)
+    assert first["status"] == "unknown_hook"
+    assert first["notified"] is True
+    assert runtime.read_text(encoding="utf-8") == "const x=1;\n"
+    assert second["status"] == "unknown_hook"
+    assert second["notified"] is False
+    assert len(notices) == 1
+    assert "升级" in notices[0][1]
+    doctor = "\n".join(mod.doctor_lines(plan.paths, runtime, node))
+    assert "last_auto_repatch: unknown_hook" in doctor
+    assert "Keysmith needs an upgrade" in doctor
+
+
+def test_auto_repatch_restarts_zcode_when_unpatched_process_is_running(tmp_path, monkeypatch):
+    monkeypatch.setattr(mod.platform, "system", lambda: "Darwin")
+    monkeypatch.setattr(mod, "is_zcode_running", lambda: True)
+    monkeypatch.setattr(mod, "wait_for_runtime_settle", lambda *a, **k: True)
+    plan, runtime, source, node = _runtime_patch_plan(tmp_path, RUNTIME_V312)
+    plan.paths.managed_dir.mkdir(parents=True)
+    plan.paths.system_file.write_text("# managed system\n", encoding="utf-8")
+    calls = []
+
+    def fake_quit(**kwargs):
+        calls.append("quit")
+        return True
+
+    def fake_open(app):
+        calls.append(("open", str(app) if app else None))
+        return True
+
+    result = mod.run_auto_repatch(
+        plan,
+        yes=True,
+        dry_run_flag=False,
+        restart=True,
+        notifier=lambda *a, **k: False,
+        quitter=fake_quit,
+        opener=fake_open,
+    )
+    assert result["status"] == "patched"
+    assert result["restarted"] is True
+    assert calls[0] == "quit"
+    assert calls[1][0] == "open"
+    assert "ZCODE_KEYSMITH_SYSTEM_FILE" in runtime.read_text(encoding="utf-8")
+
+
+def test_auto_repatch_dry_run_does_not_write(tmp_path, monkeypatch):
+    monkeypatch.setattr(mod.platform, "system", lambda: "Darwin")
+    monkeypatch.setattr(mod, "is_zcode_running", lambda: False)
+    monkeypatch.setattr(mod, "wait_for_runtime_settle", lambda *a, **k: True)
+    plan, runtime, source, node = _runtime_patch_plan(tmp_path, RUNTIME_V314)
+    plan.paths.managed_dir.mkdir(parents=True)
+    plan.paths.system_file.write_text("# managed system\n", encoding="utf-8")
+    original = runtime.read_text(encoding="utf-8")
+    result = mod.run_auto_repatch(plan, yes=False, dry_run_flag=True, restart=False)
+    assert result["status"] == "patchable"
+    assert result["write"] is False
+    assert runtime.read_text(encoding="utf-8") == original
+    assert not mod.auto_repatch_status_path(plan.paths).exists()
+
+
+def test_watch_cli_json_reports_unknown_hook(tmp_path, capsys, monkeypatch):
+    monkeypatch.setattr(mod.platform, "system", lambda: "Darwin")
+    monkeypatch.setattr(mod, "is_zcode_running", lambda: False)
+    monkeypatch.setattr(mod, "wait_for_runtime_settle", lambda *a, **k: True)
+    monkeypatch.setattr(mod, "notify_user", lambda *a, **k: True)
+    plan, runtime, source, node = _runtime_patch_plan(tmp_path, "nope")
+    plan.paths.managed_dir.mkdir(parents=True)
+    plan.paths.system_file.write_text("# managed system\n", encoding="utf-8")
+    plan.paths.config_file.write_text(
+        json.dumps({"injection_mode": "runtime-patch", "zcode_runtime": str(runtime), "node_command": str(node)}),
+        encoding="utf-8",
+    )
+    code = mod.main([
+        "watch",
+        "--managed-dir", str(plan.paths.managed_dir),
+        "--launch-agent", str(plan.paths.launch_agent),
+        "--zcode-runtime", str(runtime),
+        "--node-command", str(node),
+        "--yes",
+        "--no-restart",
+        "--json",
+    ])
+    payload = json.loads(capsys.readouterr().out)
+    assert code == 1
+    assert payload["operation"] == "watch"
+    assert payload["status"] == "unknown_hook"
+    assert payload["ok"] is False
+    assert payload["write"] is True
+    assert runtime.read_text(encoding="utf-8") == "nope"
+
+
+def test_runtime_patch_install_copies_installer_for_watch(tmp_path, monkeypatch):
+    monkeypatch.setattr(mod.platform, "system", lambda: "Darwin")
+    monkeypatch.setattr(mod, "is_zcode_running", lambda: False)
+    plan, runtime, source, node = _runtime_patch_plan(tmp_path, RUNTIME_V314)
+    code = mod.main([
+        "install",
+        "--system-file", str(source),
+        "--managed-dir", str(plan.paths.managed_dir),
+        "--launch-agent", str(plan.paths.launch_agent),
+        "--zcode-runtime", str(runtime),
+        "--node-command", str(node),
+        "--yes",
+        "--no-activate",
+    ])
+    assert code == 0
+    copied = mod.installer_copy_path(plan.paths)
+    assert copied.is_file()
+    plist = plistlib.loads(plan.paths.launch_agent.read_bytes())
+    assert "WatchPaths" in plist
+    assert str(runtime) in plist["WatchPaths"]
+    env_script = plan.paths.env_script.read_text(encoding="utf-8")
+    assert "watch --managed-dir" in env_script
+    config = json.loads(plan.paths.config_file.read_text(encoding="utf-8"))
+    assert config["auto_repatch_watch"] is True
+    assert config["auto_repatch_rearm"] is True
+    rearm_plist = plistlib.loads(plan.paths.rearm_launch_agent.read_bytes())
+    assert rearm_plist["Label"] == "com.jia.zcode-keysmith.rearm"
+    assert "WatchPaths" not in rearm_plist
+    assert plan.paths.rearm_script.is_file()
+    assert "launchctl bootstrap" in plan.paths.rearm_script.read_text(encoding="utf-8")
+
+
+def test_verify_runtime_patch_skips_wrapper_smoke_without_no_smoke(tmp_path, capsys, monkeypatch):
+    monkeypatch.setattr(mod.platform, "system", lambda: "Darwin")
+    monkeypatch.setattr(mod, "is_zcode_running", lambda: False)
+    monkeypatch.setattr(mod, "launch_agent_loaded", lambda label, runner=None: "true")
+    plan, runtime, source, node = _runtime_patch_plan(tmp_path, RUNTIME_V314)
+    assert mod.main([
+        "install",
+        "--system-file", str(source),
+        "--managed-dir", str(plan.paths.managed_dir),
+        "--launch-agent", str(plan.paths.launch_agent),
+        "--zcode-runtime", str(runtime),
+        "--node-command", str(node),
+        "--yes",
+        "--no-activate",
+    ]) == 0
+    capsys.readouterr()
+
+    wrapper = plan.paths.wrapper
+    broken = 'raise RuntimeError("ZCode runtime patch anchor not found")\n'
+    wrapper.write_text(
+        "#!/usr/bin/env python3\nimport sys\n" + broken,
+        encoding="utf-8",
+    )
+    wrapper.chmod(0o755)
+
+    code = mod.main([
+        "verify",
+        "--managed-dir", str(plan.paths.managed_dir),
+        "--launch-agent", str(plan.paths.launch_agent),
+        "--zcode-runtime", str(runtime),
+        "--node-command", str(node),
+        "--json",
+    ])
+    payload = json.loads(capsys.readouterr().out)
+    assert code == 0
+    assert payload["ok"] is True
+    assert payload["injection_mode"] == "runtime-patch"
+    assert payload["zcode_runtime_patched"] is True
+    assert payload["wrapper_smoke"] is False
+    assert payload["wrapper_smoke_detail"] == "skipped: unused in runtime-patch"
+    assert "wrapper smoke failed" not in " ".join(payload["blockers"])
+    assert payload["competing_context"]["cli_prefix_skipped"] is True
+
+
+def test_wrapper_passthrough_when_runtime_already_patched(tmp_path, monkeypatch):
+    monkeypatch.setattr(mod.platform, "system", lambda: "Darwin")
+    monkeypatch.setattr(mod, "is_zcode_running", lambda: False)
+    plan, runtime, source, node = _runtime_patch_plan(tmp_path, RUNTIME_V314)
+    assert mod.main([
+        "install",
+        "--system-file", str(source),
+        "--managed-dir", str(plan.paths.managed_dir),
+        "--launch-agent", str(plan.paths.launch_agent),
+        "--zcode-runtime", str(runtime),
+        "--node-command", str(node),
+        "--yes",
+        "--no-activate",
+    ]) == 0
+    assert "ZCODE_KEYSMITH_SYSTEM_FILE" in runtime.read_text(encoding="utf-8")
+    # Load the generated wrapper in-process. A live --help would exec NODE_COMMAND;
+    # the fixture node is a shebang stub, which Windows cannot CreateProcess.
+    spec = importlib.util.spec_from_file_location(
+        "zcode_wrapper_passthrough", plan.paths.wrapper
+    )
+    assert spec is not None and spec.loader is not None
+    wrapper_mod = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(wrapper_mod)
+    resolved = wrapper_mod.patched_runtime_path()
+    assert resolved.exists()
+    assert "ZCODE_KEYSMITH_SYSTEM_FILE" in resolved.read_text(encoding="utf-8")
+
+
+def test_recover_reapplies_runtime_patch(tmp_path, capsys, monkeypatch):
+    monkeypatch.setattr(mod.platform, "system", lambda: "Darwin")
+    monkeypatch.setattr(mod, "is_zcode_running", lambda: False)
+    monkeypatch.setattr(mod, "launch_agent_loaded", lambda label, runner=None: "true")
+    plan, runtime, source, node = _runtime_patch_plan(tmp_path, RUNTIME_V314)
+    assert mod.main([
+        "install",
+        "--system-file", str(source),
+        "--managed-dir", str(plan.paths.managed_dir),
+        "--launch-agent", str(plan.paths.launch_agent),
+        "--zcode-runtime", str(runtime),
+        "--node-command", str(node),
+        "--yes",
+        "--no-activate",
+    ]) == 0
+    capsys.readouterr()
+    runtime.write_text(RUNTIME_V314, encoding="utf-8")
+
+    preview = mod.main([
+        "recover",
+        "--managed-dir", str(plan.paths.managed_dir),
+        "--launch-agent", str(plan.paths.launch_agent),
+        "--zcode-runtime", str(runtime),
+        "--node-command", str(node),
+        "--json",
+    ])
+    preview_payload = json.loads(capsys.readouterr().out)
+    assert preview == 0
+    assert preview_payload["mode"] == "preview"
+    assert "runtime_unpatched" in preview_payload["issues"]
+    assert "reapply_runtime_patch" in preview_payload["actions"]
+    assert runtime.read_text(encoding="utf-8") == RUNTIME_V314
+
+    code = mod.main([
+        "recover",
+        "--managed-dir", str(plan.paths.managed_dir),
+        "--launch-agent", str(plan.paths.launch_agent),
+        "--zcode-runtime", str(runtime),
+        "--node-command", str(node),
+        "--yes",
+        "--json",
+    ])
+    payload = json.loads(capsys.readouterr().out)
+    assert code == 0
+    assert payload["ok"] is True
+    assert payload["runtime_patched"] is True
+    assert "ZCODE_KEYSMITH_SYSTEM_FILE" in runtime.read_text(encoding="utf-8")

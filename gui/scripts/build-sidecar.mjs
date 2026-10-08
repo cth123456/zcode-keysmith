@@ -129,13 +129,17 @@ const doctorSmoke = spawnSync(
   ],
   { encoding: "utf8" },
 );
-if (doctorSmoke.error) throw doctorSmoke.error;
-if (doctorSmoke.status !== 0 || !doctorSmoke.stdout.includes('"schema": "zcode-keysmith/v1"')) {
-  throw new Error(`Frozen sidecar doctor --json smoke failed: ${doctorSmoke.stderr || doctorSmoke.stdout}`);
-}
-if (doctorSmoke.stdout.includes("/Library/LaunchAgents/com.jia.zcode-keysmith.env.plist")) {
-  throw new Error("Frozen sidecar doctor smoke probed the live LaunchAgent; refusing to package");
-}
+	if (doctorSmoke.error) throw doctorSmoke.error;
+	// An empty temp dir is not installed, so doctor exits 1 with blockers.
+	// The smoke only proves the frozen binary speaks the contract and does not
+	// touch the live LaunchAgent. Exit 0 is not required.
+	const doctorOut = `${doctorSmoke.stdout}\n${doctorSmoke.stderr}`;
+	if (!doctorSmoke.stdout.includes('"schema": "zcode-keysmith/v1"')) {
+	  throw new Error(`Frozen sidecar doctor --json smoke failed: ${doctorOut}`);
+	}
+	if (doctorOut.includes("/Library/LaunchAgents/com.jia.zcode-keysmith.env.plist")) {
+	  throw new Error("Frozen sidecar doctor smoke probed the live LaunchAgent; refusing to package");
+	}
 rmSync(smokeHome, { recursive: true, force: true });
 
 console.log(`Built ${destination}`);

@@ -1,5 +1,13 @@
 import { describe, expect, it } from "vitest";
-import { SCHEMA, parseDoctorReport, parseWriteReport, buildInstallArgs, buildDoctorArgs } from "./parser.js";
+import {
+  SCHEMA,
+  ContractError,
+  parseContract,
+  parseDoctorReport,
+  parseWriteReport,
+  buildInstallArgs,
+  buildDoctorArgs,
+} from "./parser.js";
 
 describe("parseDoctorReport", () => {
   it("maps managed / runtime / env and health", () => {
@@ -26,6 +34,27 @@ describe("parseDoctorReport", () => {
     expect(model.managed.wrapperExists).toBe(true);
     expect(model.runtime.patchable).toBe(true);
     expect(model.backups).toHaveLength(1);
+  });
+});
+
+describe("parseContract timeout", () => {
+  it("fails closed and keeps stdout/stderr/exit for StatusFailure", () => {
+    const output = {
+      stdout: "partial {",
+      stderr: "still draining",
+      exit_code: -1,
+      timed_out: true,
+    };
+    try {
+      parseContract(output);
+      throw new Error("expected ContractError");
+    } catch (error) {
+      expect(error).toBeInstanceOf(ContractError);
+      expect(error.timedOut).toBe(true);
+      expect(error.exitCode).toBe(-1);
+      expect(error.stdout).toBe("partial {");
+      expect(error.stderr).toBe("still draining");
+    }
   });
 });
 

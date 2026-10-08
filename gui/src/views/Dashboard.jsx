@@ -83,12 +83,7 @@ export function Dashboard() {
         </FadeIn>
       )}
 
-      {error && (
-        <p className="mb-4 flex items-start gap-2 text-sm text-danger">
-          <AlertTriangle className="mt-0.5 size-4 shrink-0" aria-hidden="true" />
-          {error.message}
-        </p>
-      )}
+      {error && <StatusFailure error={error} t={t} />}
 
       {status && (
         <FadeIn>
@@ -123,6 +118,58 @@ export function Dashboard() {
         </FadeIn>
       )}
     </div>
+  );
+}
+
+export function StatusFailure({ error, t }) {
+  const stdout = String(error.stdout ?? error.output?.stdout ?? "");
+  const stderr = String(error.stderr ?? error.output?.stderr ?? "");
+  const timedOut = Boolean(error.timedOut ?? error.output?.timed_out);
+  const exitCode = error.exitCode ?? error.output?.exit_code ?? null;
+  const hasStructuredOutput = stdout.trim() || stderr.trim();
+
+  return (
+    <FadeIn delay={0.1}>
+      <div className="card-glass mb-4 border-danger/40 p-5" role="alert">
+        <div className="flex items-center gap-2 text-sm font-semibold text-danger">
+          <AlertTriangle className="size-4 shrink-0" aria-hidden="true" />
+          {t("dash.error")}
+        </div>
+        {(timedOut || exitCode !== null) && (
+          <dl className="mt-2.5 grid grid-cols-[auto_1fr] gap-x-3 gap-y-1 text-xs text-secondary-foreground">
+            {timedOut && (
+              <>
+                <dt className="text-muted-foreground">{t("dash.diagnosticTimeout")}</dt>
+                <dd>{t("dash.diagnosticYes")}</dd>
+              </>
+            )}
+            {exitCode !== null && (
+              <>
+                <dt className="text-muted-foreground">{t("dash.diagnosticExitCode")}</dt>
+                <dd className="font-mono">{exitCode}</dd>
+              </>
+            )}
+          </dl>
+        )}
+        {stderr.trim() && (
+          <div className="mt-3">
+            <div className="text-xs font-medium text-muted-foreground">
+              {t("dash.diagnosticStderr")}
+            </div>
+            <pre className="log-block mt-1.5">{stderr}</pre>
+          </div>
+        )}
+        {stdout.trim() && (
+          <div className="mt-3">
+            <div className="text-xs font-medium text-muted-foreground">
+              {t("dash.diagnosticStdout")}
+            </div>
+            <pre className="log-block mt-1.5">{stdout}</pre>
+          </div>
+        )}
+        {!hasStructuredOutput && <pre className="log-block mt-2.5">{error.message}</pre>}
+      </div>
+    </FadeIn>
   );
 }
 
